@@ -1,5 +1,6 @@
 use std::fmt;
 use std::io;
+use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -153,7 +154,11 @@ impl<T: Serialize + DeserializeOwned> Sender<T> {
         // we always serialize a dummy bool at the end so that the message
         // will not be empty because of zero sized types.
         let (payload, fds) = serialize((s, true))?;
-        self.raw_sender.send(&payload, &fds).await?;
+        let res = self.raw_sender.send(&payload, &fds).await;
+        for fd in fds.into_iter() {
+            let _ = unsafe { OwnedFd::from_raw_fd(fd) };
+        }
+        res?;
         Ok(())
     }
 }

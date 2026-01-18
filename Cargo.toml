@@ -10,7 +10,7 @@ keywords = ["ipc", "unix-socket", "subprocess"]
 readme = "README.md"
 autoexamples = true
 autotests = true
-rust-version = "1.60"
+rust-version = "1.63"
 
 [package.metadata.docs.rs]
 all-features = true

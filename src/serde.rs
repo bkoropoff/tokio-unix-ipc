@@ -17,7 +17,7 @@ structural serialization (currently uses msgpack).  This requires the
 use std::cell::RefCell;
 use std::io;
 use std::mem;
-use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
+use std::os::unix::io::{BorrowedFd, FromRawFd, IntoRawFd, RawFd};
 use std::sync::Mutex;
 
 use serde_::{de, ser};
@@ -80,7 +80,12 @@ impl Serialize for HandleRef {
     {
         if is_ipc_mode() {
             let fd = self.0;
-            let idx = register_fd(fd);
+            let idx = register_fd(
+                unsafe { BorrowedFd::borrow_raw(fd) }
+                    .try_clone_to_owned()
+                    .map_err(ser::Error::custom)?
+                    .into_raw_fd(),
+            );
             idx.serialize(serializer)
         } else {
             Err(ser::Error::custom("can only serialize in ipc mode"))
@@ -93,7 +98,12 @@ impl<F: FromRawFd + IntoRawFd> Serialize for Handle<F> {
     where
         S: ser::Serializer,
     {
-        HandleRef(self.extract_raw_fd()).serialize(serializer)
+        if is_ipc_mode() {
+            let idx = register_fd(self.extract_raw_fd());
+            idx.serialize(serializer)
+        } else {
+            Err(ser::Error::custom("can only serialize in ipc mode"))
+        }
     }
 }
 
