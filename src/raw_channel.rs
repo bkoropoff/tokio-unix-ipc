@@ -163,20 +163,21 @@ macro_rules! nix_eintr {
 fn recv_impl(
     fd: RawFd,
     buf: &mut [u8],
-    fds: Option<Vec<i32>>,
+    fds: &mut Vec<RawFd>,
     fd_count: usize,
     _want_creds: bool,
-) -> io::Result<(usize, Option<Vec<RawFd>>, Option<Credentials>)> {
+) -> io::Result<(usize, Option<Credentials>)> {
     let mut iov = [IoSliceMut::new(buf)];
-    let mut new_fds = None;
 
     #[allow(unused_mut)]
     let mut creds = None;
 
     // Compute the size of ancillary data, combining expected number of file descriptors
-    // with any space needed for credentials.
+    // with any space needed for credentials.  Subtract already-accumulated fds so the
+    // cmsg buffer shrinks appropriately on retries.
     let msgspace_size = {
-        let fd_size = unsafe { CMSG_SPACE(mem::size_of::<RawFd>() as c_uint) * fd_count as u32 };
+        let remaining = fd_count.saturating_sub(fds.len());
+        let fd_size = unsafe { CMSG_SPACE(mem::size_of::<RawFd>() as c_uint) * remaining as u32 };
         #[cfg(any(target_os = "android", target_os = "linux"))]
         {
             let cred_size: u32 = _want_creds
@@ -195,19 +196,21 @@ fn recv_impl(
 
     let msg = nix_eintr!(recvmsg::<()>(fd, &mut iov, Some(&mut cmsgspace), MSG_FLAGS))?;
 
+    let mut received_fds = false;
     for cmsg in msg.cmsgs() {
         match cmsg {
-            ControlMessageOwned::ScmRights(fds) => {
-                if !fds.is_empty() {
+            ControlMessageOwned::ScmRights(new_fds) => {
+                if !new_fds.is_empty() {
                     #[cfg(target_os = "macos")]
                     unsafe {
-                        for &fd in &fds {
+                        for &fd in &new_fds {
                             // as per documentation this does not ever fail
                             // with EINTR
                             libc::ioctl(fd, libc::FIOCLEX);
                         }
                     }
-                    new_fds = Some(fds);
+                    fds.extend(new_fds);
+                    received_fds = true;
                 }
             }
             #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -218,23 +221,14 @@ fn recv_impl(
         }
     }
 
-    if msg.bytes == 0 {
+    if msg.bytes == 0 && !received_fds {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "could not read",
         ));
     }
 
-    let fds = match (fds, new_fds) {
-        (None, Some(new)) => Some(new),
-        (Some(mut old), Some(new)) => {
-            old.extend(new);
-            Some(old)
-        }
-        (old, None) => old,
-    };
-
-    Ok((msg.bytes, fds, creds))
+    Ok((msg.bytes, creds))
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -328,7 +322,7 @@ impl RawReceiver {
         let (_, fds, _) = self
             .recv_impl(&mut buf, header.fd_count as usize, false)
             .await?;
-        Ok((buf, fds))
+        Ok((buf, if fds.is_empty() { None } else { Some(fds) }))
     }
 
     /// Receives raw bytes and credentials from the socket.
@@ -353,7 +347,7 @@ impl RawReceiver {
         let (_, fds, _) = self
             .recv_impl(&mut buf, header.fd_count as usize, false)
             .await?;
-        Ok((buf, fds, creds))
+        Ok((buf, if fds.is_empty() { None } else { Some(fds) }, creds))
     }
 
     async fn recv_impl(
@@ -361,17 +355,18 @@ impl RawReceiver {
         buf: &mut [u8],
         fd_count: usize,
         want_creds: bool,
-    ) -> io::Result<(usize, Option<Vec<RawFd>>, Option<Credentials>)> {
+    ) -> io::Result<(usize, Vec<RawFd>, Option<Credentials>)> {
         let mut pos = 0;
-        let mut fds = None;
+        let mut fds = Vec::new();
+        let mut last_creds = None;
 
         loop {
             let mut guard = self.inner.readable().await?;
-            let (bytes, new_fds, creds) = match guard.try_io(|inner| {
+            let (bytes, creds) = match guard.try_io(|inner| {
                 recv_impl(
                     inner.as_raw_fd(),
                     &mut buf[pos..],
-                    fds.take(),
+                    &mut fds,
                     fd_count,
                     want_creds,
                 )
@@ -380,10 +375,12 @@ impl RawReceiver {
                 Err(_would_block) => continue,
             }?;
 
-            fds = new_fds;
+            if creds.is_some() {
+                last_creds = creds;
+            }
             pos += bytes;
             if pos >= buf.len() {
-                return Ok((pos, fds, creds));
+                return Ok((pos, fds, last_creds));
             }
         }
     }
