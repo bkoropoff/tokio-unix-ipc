@@ -1,6 +1,6 @@
 use std::fs;
 use std::io;
-use std::os::unix::prelude::RawFd;
+use std::os::fd::BorrowedFd;
 use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
 
@@ -62,7 +62,7 @@ impl Bootstrapper {
     /// This can be called multiple times to send more than one value
     /// into the inner socket. On the other side a
     /// [`RawReceiver`](crate::RawReceiver) must be used.
-    pub async fn send_raw(&self, data: &[u8], fds: &[RawFd]) -> io::Result<usize> {
+    pub async fn send_raw(&self, data: &[u8], fds: &[BorrowedFd<'_>]) -> io::Result<usize> {
         if self.sender.lock().await.is_none() {
             let (sock, _) = self.listener.accept().await?;
             let sender = RawSender::from_std(sock.into_std()?)?;
@@ -87,7 +87,8 @@ impl Bootstrapper {
     ) -> io::Result<()> {
         // replicate the logic from the typed sender with the dummy
         // bool here.
-        let (bytes, fds) = crate::serde::serialize((data, true))?;
+        let to_send = (data, true);
+        let (bytes, fds) = crate::serde::serialize(&to_send)?;
         self.send_raw(&bytes, &fds).await.map(|_| ())
     }
 }

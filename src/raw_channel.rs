@@ -1,17 +1,15 @@
 use std::io;
 use std::io::{IoSlice, IoSliceMut};
 use std::mem;
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::slice;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use nix::errno::Errno;
 use nix::sys::socket::{
     c_uint, recvmsg, sendmsg, ControlMessage, ControlMessageOwned, MsgFlags, CMSG_SPACE,
 };
-use nix::unistd;
 
 use tokio::io::unix::AsyncFd;
 
@@ -91,8 +89,7 @@ macro_rules! fd_impl {
         impl $ty {
             pub(crate) unsafe fn from_raw_fd(fd: RawFd) -> io::Result<Self> {
                 Ok(Self {
-                    inner: AsyncFd::new(fd)?,
-                    dead: AtomicBool::new(false),
+                    inner: AsyncFd::new(unsafe { OwnedFd::from_raw_fd(fd) })?,
                 })
             }
 
@@ -105,42 +102,36 @@ macro_rules! fd_impl {
             /// This function panics if it is not called from within a runtime with
             /// IO enabled.
             pub fn from_std(stream: UnixStream) -> io::Result<Self> {
-                unsafe { Self::from_raw_fd(stream.into_raw_fd()) }
+                Ok(Self {
+                    inner: AsyncFd::new(OwnedFd::from(stream))?,
+                })
             }
+        }
 
-            pub(crate) fn extract_raw_fd(&self) -> RawFd {
-                if self.dead.swap(true, Ordering::SeqCst) {
-                    panic!("handle was moved previously");
-                } else {
-                    self.inner.as_raw_fd()
+        impl From<OwnedFd> for $ty {
+            fn from(fd: OwnedFd) -> Self {
+                Self {
+                    inner: AsyncFd::new(fd)
+                        .expect("conversion from OwnedFd requires an active tokio runtime"),
                 }
             }
         }
 
-        impl FromRawFd for $ty {
-            unsafe fn from_raw_fd(fd: RawFd) -> Self {
-                Self::from_raw_fd(fd)
-                    .expect("conversion from RawFd requires an active tokio runtime")
+        impl From<$ty> for OwnedFd {
+            fn from(val: $ty) -> OwnedFd {
+                val.inner.into_inner()
             }
         }
 
-        impl IntoRawFd for $ty {
-            fn into_raw_fd(self) -> RawFd {
-                self.extract_raw_fd()
+        impl AsFd for $ty {
+            fn as_fd(&self) -> BorrowedFd<'_> {
+                unsafe { BorrowedFd::borrow_raw(self.inner.as_raw_fd()) }
             }
         }
 
         impl AsRawFd for $ty {
             fn as_raw_fd(&self) -> RawFd {
                 self.inner.as_raw_fd()
-            }
-        }
-
-        impl Drop for $ty {
-            fn drop(&mut self) {
-                if !self.dead.load(Ordering::SeqCst) {
-                    unistd::close(self.as_raw_fd()).ok();
-                }
             }
         }
     };
@@ -163,20 +154,21 @@ macro_rules! nix_eintr {
 fn recv_impl(
     fd: RawFd,
     buf: &mut [u8],
-    fds: Option<Vec<i32>>,
+    fds: &mut Vec<OwnedFd>,
     fd_count: usize,
     _want_creds: bool,
-) -> io::Result<(usize, Option<Vec<RawFd>>, Option<Credentials>)> {
+) -> io::Result<(usize, Option<Credentials>)> {
     let mut iov = [IoSliceMut::new(buf)];
-    let mut new_fds = None;
 
     #[allow(unused_mut)]
     let mut creds = None;
 
     // Compute the size of ancillary data, combining expected number of file descriptors
-    // with any space needed for credentials.
+    // with any space needed for credentials.  Subtract already-accumulated fds so the
+    // cmsg buffer shrinks appropriately on retries.
     let msgspace_size = {
-        let fd_size = unsafe { CMSG_SPACE(mem::size_of::<RawFd>() as c_uint) * fd_count as u32 };
+        let remaining = fd_count.saturating_sub(fds.len());
+        let fd_size = unsafe { CMSG_SPACE(mem::size_of::<RawFd>() as c_uint) * remaining as u32 };
         #[cfg(any(target_os = "android", target_os = "linux"))]
         {
             let cred_size: u32 = _want_creds
@@ -195,19 +187,25 @@ fn recv_impl(
 
     let msg = nix_eintr!(recvmsg::<()>(fd, &mut iov, Some(&mut cmsgspace), MSG_FLAGS))?;
 
+    let mut received_fds = false;
     for cmsg in msg.cmsgs() {
         match cmsg {
-            ControlMessageOwned::ScmRights(fds) => {
-                if !fds.is_empty() {
+            ControlMessageOwned::ScmRights(new_fds) => {
+                if !new_fds.is_empty() {
                     #[cfg(target_os = "macos")]
                     unsafe {
-                        for &fd in &fds {
+                        for &fd in &new_fds {
                             // as per documentation this does not ever fail
                             // with EINTR
                             libc::ioctl(fd, libc::FIOCLEX);
                         }
                     }
-                    new_fds = Some(fds);
+                    fds.extend(
+                        new_fds
+                            .into_iter()
+                            .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }),
+                    );
+                    received_fds = true;
                 }
             }
             #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -218,23 +216,14 @@ fn recv_impl(
         }
     }
 
-    if msg.bytes == 0 {
+    if msg.bytes == 0 && !received_fds {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "could not read",
         ));
     }
 
-    let fds = match (fds, new_fds) {
-        (None, Some(new)) => Some(new),
-        (Some(mut old), Some(new)) => {
-            old.extend(new);
-            Some(old)
-        }
-        (old, None) => old,
-    };
-
-    Ok((msg.bytes, fds, creds))
+    Ok((msg.bytes, creds))
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -309,8 +298,7 @@ pub fn raw_channel_from_std(sender: UnixStream) -> io::Result<(RawSender, RawRec
 /// An async raw receiver.
 #[derive(Debug)]
 pub struct RawReceiver {
-    inner: AsyncFd<RawFd>,
-    dead: AtomicBool,
+    inner: AsyncFd<OwnedFd>,
 }
 
 impl RawReceiver {
@@ -321,7 +309,7 @@ impl RawReceiver {
     }
 
     /// Receives raw bytes from the socket.
-    pub async fn recv(&self) -> io::Result<(Vec<u8>, Option<Vec<RawFd>>)> {
+    pub async fn recv(&self) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
         let mut header = MsgHeader::default();
         self.recv_impl(header.as_buf_mut(), 0, false).await?;
         let mut buf = header.make_buffer();
@@ -333,9 +321,7 @@ impl RawReceiver {
 
     /// Receives raw bytes and credentials from the socket.
     #[cfg(any(target_os = "android", target_os = "linux"))]
-    pub async fn recv_with_credentials(
-        &self,
-    ) -> io::Result<(Vec<u8>, Option<Vec<RawFd>>, Credentials)> {
+    pub async fn recv_with_credentials(&self) -> io::Result<(Vec<u8>, Vec<OwnedFd>, Credentials)> {
         nix::sys::socket::setsockopt(
             self.inner.as_raw_fd(),
             nix::sys::socket::sockopt::PassCred,
@@ -361,17 +347,18 @@ impl RawReceiver {
         buf: &mut [u8],
         fd_count: usize,
         want_creds: bool,
-    ) -> io::Result<(usize, Option<Vec<RawFd>>, Option<Credentials>)> {
+    ) -> io::Result<(usize, Vec<OwnedFd>, Option<Credentials>)> {
         let mut pos = 0;
-        let mut fds = None;
+        let mut fds = Vec::new();
+        let mut last_creds = None;
 
         loop {
             let mut guard = self.inner.readable().await?;
-            let (bytes, new_fds, creds) = match guard.try_io(|inner| {
+            let (bytes, creds) = match guard.try_io(|inner| {
                 recv_impl(
                     inner.as_raw_fd(),
                     &mut buf[pos..],
-                    fds.take(),
+                    &mut fds,
                     fd_count,
                     want_creds,
                 )
@@ -380,10 +367,12 @@ impl RawReceiver {
                 Err(_would_block) => continue,
             }?;
 
-            fds = new_fds;
+            if creds.is_some() {
+                last_creds = creds;
+            }
             pos += bytes;
-            if pos >= buf.len() {
-                return Ok((pos, fds, creds));
+            if pos >= buf.len() && fds.len() >= fd_count {
+                return Ok((pos, fds, last_creds));
             }
         }
     }
@@ -395,14 +384,12 @@ unsafe impl Sync for RawReceiver {}
 /// An async raw sender.
 #[derive(Debug)]
 pub struct RawSender {
-    inner: AsyncFd<RawFd>,
-    #[allow(dead_code)]
-    dead: AtomicBool,
+    inner: AsyncFd<OwnedFd>,
 }
 
 impl RawSender {
     /// Sends raw bytes and fds.
-    pub async fn send(&self, data: &[u8], fds: &[RawFd]) -> io::Result<usize> {
+    pub async fn send(&self, data: &[u8], fds: &[BorrowedFd<'_>]) -> io::Result<usize> {
         let header = MsgHeader {
             payload_len: data.len() as u32,
             fd_count: fds.len() as u32,
@@ -413,7 +400,11 @@ impl RawSender {
 
     /// Sends raw bytes and fds along with current process credentials.
     #[cfg(any(target_os = "android", target_os = "linux"))]
-    pub async fn send_with_credentials(&self, data: &[u8], fds: &[RawFd]) -> io::Result<usize> {
+    pub async fn send_with_credentials(
+        &self,
+        data: &[u8],
+        fds: &[BorrowedFd<'_>],
+    ) -> io::Result<usize> {
         let header = MsgHeader {
             payload_len: data.len() as u32,
             fd_count: fds.len() as u32,
@@ -422,18 +413,27 @@ impl RawSender {
         self.send_impl(data, fds, false).await
     }
 
-    async fn send_impl(&self, data: &[u8], mut fds: &[RawFd], creds: bool) -> io::Result<usize> {
+    async fn send_impl(
+        &self,
+        data: &[u8],
+        fds: &[BorrowedFd<'_>],
+        creds: bool,
+    ) -> io::Result<usize> {
+        // SAFETY: BorrowedFd is #[repr(transparent)] over RawFd
+        let raw_fds: &[RawFd] =
+            unsafe { slice::from_raw_parts(fds.as_ptr() as *const RawFd, fds.len()) };
         let mut pos = 0;
+        let mut send_fds = raw_fds;
         loop {
             let mut guard = self.inner.writable().await?;
             let sent = match guard
-                .try_io(|inner| send_impl(inner.as_raw_fd(), &data[pos..], fds, creds))
+                .try_io(|inner| send_impl(inner.as_raw_fd(), &data[pos..], send_fds, creds))
             {
                 Ok(result) => result,
                 Err(_would_block) => continue,
             }?;
             pos += sent;
-            fds = &[][..];
+            send_fds = &[][..];
             if pos >= data.len() {
                 return Ok(pos);
             }

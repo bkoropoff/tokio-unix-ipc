@@ -17,59 +17,50 @@ structural serialization (currently uses msgpack).  This requires the
 use std::cell::RefCell;
 use std::io;
 use std::mem;
-use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
-use std::sync::Mutex;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
 use serde_::{de, ser};
 use serde_::{de::DeserializeOwned, Deserialize, Serialize};
 
 thread_local! {
-    static IPC_FDS: RefCell<Vec<Vec<RawFd>>> = const {RefCell::new(Vec::new())};
+    // Ser: stack of raw fd accumulator vecs
+    static IPC_SER_FDS: RefCell<Vec<Vec<RawFd>>> = const { RefCell::new(Vec::new()) };
+    // Deser: stack of Option<OwnedFd> vecs being consumed
+    static IPC_DESER_FDS: RefCell<Vec<Vec<Option<OwnedFd>>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Can transfer a unix file handle across processes.
 ///
-/// The basic requirement is that you have an object that can be converted
-/// into a raw file handle and back.  This for instance is the case for
-/// regular file objects, sockets and many more things.
-///
-/// Once the handle has been serialized the handle no longer lets you
-/// extract the value contained in it.
-///
-/// For customizing the serialization of libraries the
-/// [`HandleRef`](struct.HandleRef.html) object should be used instead.
-pub struct Handle<F>(Mutex<Option<F>>);
+/// The basic requirement is that you have an object that implements
+/// [`AsFd`] (for serialization) and [`From<OwnedFd>`] (for deserialization).
+/// This is the case for regular file objects, sockets, and many more things.
+pub struct Handle<F>(F);
 
 /// A raw reference to a handle.
 ///
 /// This serializes the same way as a `Handle` but only uses a raw
 /// fd to represent it.  Useful to implement custom serializers.
+///
+/// Note: `HandleRef` holds a `RawFd` (not `BorrowedFd`) because it must
+/// be usable in `Send + 'static` message types.  The caller is responsible
+/// for ensuring the fd remains valid for the duration of serialization.
 pub struct HandleRef(pub RawFd);
 
-impl<F: FromRawFd + IntoRawFd> Handle<F> {
+impl<F> Handle<F> {
     /// Wraps the value in a handle.
     pub fn new(f: F) -> Self {
-        f.into()
-    }
-
-    fn extract_raw_fd(&self) -> RawFd {
-        self.0
-            .lock()
-            .unwrap()
-            .take()
-            .map(|x| x.into_raw_fd())
-            .expect("cannot serialize handle twice")
+        Handle(f)
     }
 
     /// Extracts the internal value.
     pub fn into_inner(self) -> F {
-        self.0.lock().unwrap().take().expect("handle was moved")
+        self.0
     }
 }
 
-impl<F: FromRawFd + IntoRawFd> From<F> for Handle<F> {
+impl<F> From<F> for Handle<F> {
     fn from(f: F) -> Self {
-        Handle(Mutex::new(Some(f)))
+        Handle(f)
     }
 }
 
@@ -79,8 +70,7 @@ impl Serialize for HandleRef {
         S: ser::Serializer,
     {
         if is_ipc_mode() {
-            let fd = self.0;
-            let idx = register_fd(fd);
+            let idx = register_fd(self.0);
             idx.serialize(serializer)
         } else {
             Err(ser::Error::custom("can only serialize in ipc mode"))
@@ -88,59 +78,89 @@ impl Serialize for HandleRef {
     }
 }
 
-impl<F: FromRawFd + IntoRawFd> Serialize for Handle<F> {
+impl<F: AsFd> Serialize for Handle<F> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: ser::Serializer,
     {
-        HandleRef(self.extract_raw_fd()).serialize(serializer)
+        if is_ipc_mode() {
+            let raw_fd = self.0.as_fd().as_raw_fd();
+            let idx = register_fd(raw_fd);
+            idx.serialize(serializer)
+        } else {
+            Err(ser::Error::custom("can only serialize in ipc mode"))
+        }
     }
 }
 
-impl<'de, F: FromRawFd + IntoRawFd> Deserialize<'de> for Handle<F> {
+impl<'de, F: From<OwnedFd>> Deserialize<'de> for Handle<F> {
     fn deserialize<D>(deserializer: D) -> Result<Handle<F>, D::Error>
     where
         D: de::Deserializer<'de>,
     {
         if is_ipc_mode() {
             let idx = u32::deserialize(deserializer)?;
-            let fd = lookup_fd(idx).ok_or_else(|| de::Error::custom("fd not found in mapping"))?;
-            unsafe { Ok(Handle(Mutex::new(Some(FromRawFd::from_raw_fd(fd))))) }
+            let owned =
+                lookup_fd(idx).ok_or_else(|| de::Error::custom("fd not found in mapping"))?;
+            Ok(Handle(F::from(owned)))
         } else {
             Err(de::Error::custom("can only deserialize in ipc mode"))
         }
     }
 }
 
-struct ResetIpcSerde;
+struct ResetSerSerde;
 
-impl Drop for ResetIpcSerde {
+impl Drop for ResetSerSerde {
     fn drop(&mut self) {
-        IPC_FDS.with(|x| x.borrow_mut().pop());
+        IPC_SER_FDS.with(|x| x.borrow_mut().pop());
     }
 }
 
-fn enter_ipc_mode<F: FnOnce() -> R, R>(f: F, fds: &mut Vec<RawFd>) -> R {
-    IPC_FDS.with(|x| x.borrow_mut().push(fds.clone()));
-    let reset = ResetIpcSerde;
+struct ResetDeserSerde;
+
+impl Drop for ResetDeserSerde {
+    fn drop(&mut self) {
+        IPC_DESER_FDS.with(|x| x.borrow_mut().pop());
+    }
+}
+
+fn enter_ser_mode<F: FnOnce() -> R, R>(f: F, fds: &mut Vec<RawFd>) -> R {
+    IPC_SER_FDS.with(|x| x.borrow_mut().push(Vec::new()));
+    let reset = ResetSerSerde;
     let rv = f();
-    *fds = IPC_FDS.with(|x| x.borrow_mut().pop()).unwrap_or_default();
+    *fds = IPC_SER_FDS
+        .with(|x| x.borrow_mut().pop())
+        .unwrap_or_default();
     mem::forget(reset);
     rv
 }
 
-fn register_fd(fd: RawFd) -> u32 {
-    IPC_FDS.with(|x| {
+fn enter_deser_mode<F: FnOnce() -> R, R>(f: F, fds: Vec<Option<OwnedFd>>) -> R {
+    IPC_DESER_FDS.with(|x| x.borrow_mut().push(fds));
+    let reset = ResetDeserSerde;
+    let rv = f();
+    // pop drops the vec, auto-closing any remaining (unused) OwnedFds
+    IPC_DESER_FDS.with(|x| x.borrow_mut().pop());
+    mem::forget(reset);
+    rv
+}
+
+fn register_fd(raw_fd: RawFd) -> u32 {
+    IPC_SER_FDS.with(|x| {
         let mut x = x.borrow_mut();
         let fds = x.last_mut().unwrap();
         let rv = fds.len() as u32;
-        fds.push(fd);
+        fds.push(raw_fd);
         rv
     })
 }
 
-fn lookup_fd(idx: u32) -> Option<RawFd> {
-    IPC_FDS.with(|x| x.borrow().last().and_then(|l| l.get(idx as usize).copied()))
+fn lookup_fd(idx: u32) -> Option<OwnedFd> {
+    IPC_DESER_FDS.with(|x| {
+        let mut x = x.borrow_mut();
+        x.last_mut()?.get_mut(idx as usize)?.take()
+    })
 }
 
 /// Checks if serde is in IPC mode.
@@ -148,7 +168,7 @@ fn lookup_fd(idx: u32) -> Option<RawFd> {
 /// This can be used to customize the behavior of serialization/deserialization
 /// implementations for the use with unix-ipc.
 pub fn is_ipc_mode() -> bool {
-    IPC_FDS.with(|x| !x.borrow().is_empty())
+    IPC_SER_FDS.with(|x| !x.borrow().is_empty()) || IPC_DESER_FDS.with(|x| !x.borrow().is_empty())
 }
 
 #[allow(clippy::boxed_local)]
@@ -161,26 +181,40 @@ fn bincode_to_io_error(err: bincode::Error) -> io::Error {
 
 /// Serializes something for IPC communication.
 ///
+/// Takes a reference to keep the source value (and any file handles it contains)
+/// alive until the caller has finished sending.  The returned `BorrowedFd` slice
+/// is tied to the lifetime of `s`: the caller must keep `s` alive until after
+/// the fds have been transmitted via `sendmsg`.
+///
 /// This uses bincode for serialization.  Because UNIX sockets require that
 /// file descriptors are transmitted separately they are accumulated in a
 /// separate buffer.
-pub fn serialize<S: Serialize>(s: S) -> io::Result<(Vec<u8>, Vec<RawFd>)> {
-    let mut fds = Vec::new();
+pub fn serialize<'a, S: Serialize>(s: &'a S) -> io::Result<(Vec<u8>, Vec<BorrowedFd<'a>>)> {
+    let mut raw_fds: Vec<RawFd> = Vec::new();
     let mut out = Vec::new();
-    enter_ipc_mode(|| bincode::serialize_into(&mut out, &s), &mut fds)
+    enter_ser_mode(|| bincode::serialize_into(&mut out, s), &mut raw_fds)
         .map_err(bincode_to_io_error)?;
+    // SAFETY: BorrowedFd<'a> is #[repr(transparent)] over RawFd.  All raw_fds
+    // were obtained via AsFd borrows from *s, so they are valid for 'a.
+    let fds = unsafe {
+        let mut raw_fds = mem::ManuallyDrop::new(raw_fds);
+        Vec::from_raw_parts(
+            raw_fds.as_mut_ptr() as *mut BorrowedFd<'a>,
+            raw_fds.len(),
+            raw_fds.capacity(),
+        )
+    };
     Ok((out, fds))
 }
 
 /// Deserializes something for IPC communication.
 ///
-/// File descriptors need to be provided for deserialization if handleds are
-/// involved.
-pub fn deserialize<D: DeserializeOwned>(bytes: &[u8], fds: &[RawFd]) -> io::Result<D> {
-    let mut fds = fds.to_owned();
-    let result =
-        enter_ipc_mode(|| bincode::deserialize(bytes), &mut fds).map_err(bincode_to_io_error)?;
-    Ok(result)
+/// File descriptors need to be provided for deserialization if handles are
+/// involved.  Ownership of the fds is transferred; any that are not consumed
+/// by deserialization are closed automatically.
+pub fn deserialize<D: DeserializeOwned>(bytes: &[u8], fds: Vec<OwnedFd>) -> io::Result<D> {
+    let slot: Vec<Option<OwnedFd>> = fds.into_iter().map(Some).collect();
+    enter_deser_mode(|| bincode::deserialize(bytes), slot).map_err(bincode_to_io_error)
 }
 
 macro_rules! implement_handle_serialization {
@@ -191,7 +225,7 @@ macro_rules! implement_handle_serialization {
                 S: $crate::_serde_ref::ser::Serializer,
             {
                 $crate::_serde_ref::Serialize::serialize(
-                    &$crate::serde::HandleRef(self.extract_raw_fd()),
+                    &$crate::serde::HandleRef(self.as_raw_fd()),
                     serializer,
                 )
             }
@@ -220,7 +254,7 @@ macro_rules! implement_typed_handle_serialization {
                 S: $crate::_serde_ref::ser::Serializer,
             {
                 $crate::_serde_ref::Serialize::serialize(
-                    &$crate::serde::HandleRef(self.extract_raw_fd()),
+                    &$crate::serde::HandleRef(self.as_raw_fd()),
                     serializer,
                 )
             }
@@ -296,8 +330,13 @@ fn test_basic() {
     use std::io::Read;
     let f = std::fs::File::open("src/serde.rs").unwrap();
     let handle = Handle::from(f);
-    let (bytes, fds) = serialize(handle).unwrap();
-    let f2: Handle<std::fs::File> = deserialize(&bytes, &fds).unwrap();
+    let (bytes, fds) = serialize(&handle).unwrap();
+    // Dup each fd manually to simulate what SCM_RIGHTS does across processes
+    let owned_fds: Vec<OwnedFd> = fds
+        .iter()
+        .map(|f| f.try_clone_to_owned().unwrap())
+        .collect();
+    let f2: Handle<std::fs::File> = deserialize(&bytes, owned_fds).unwrap();
     let mut out = Vec::new();
     f2.into_inner().read_to_end(&mut out).unwrap();
     assert!(out.len() > 100);
@@ -319,11 +358,15 @@ fn test_structural() {
         inner: InnerStruct,
     }
 
-    let (bytes, fds) = serialize(Structural(BadStruct {
+    let (bytes, fds) = serialize(&Structural(BadStruct {
         inner: InnerStruct { value: 42 },
     }))
     .unwrap();
-    let value: Structural<BadStruct> = deserialize(&bytes, &fds).unwrap();
+    let owned_fds: Vec<OwnedFd> = fds
+        .iter()
+        .map(|f| f.try_clone_to_owned().unwrap())
+        .collect();
+    let value: Structural<BadStruct> = deserialize(&bytes, owned_fds).unwrap();
     assert_eq!(
         value.0,
         BadStruct {

@@ -1,6 +1,6 @@
 use std::fmt;
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
@@ -55,24 +55,20 @@ macro_rules! fd_impl {
                     _marker: std::marker::PhantomData,
                 })
             }
-
-            pub(crate) fn extract_raw_fd(&self) -> RawFd {
-                self.$field.extract_raw_fd()
-            }
         }
 
-        impl<T: Serialize + DeserializeOwned> FromRawFd for $ty {
-            unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        impl<T: Serialize + DeserializeOwned> From<OwnedFd> for $ty {
+            fn from(fd: OwnedFd) -> Self {
                 Self {
-                    $field: FromRawFd::from_raw_fd(fd),
+                    $field: $raw_ty::from(fd),
                     _marker: std::marker::PhantomData,
                 }
             }
         }
 
-        impl<T> IntoRawFd for $ty {
-            fn into_raw_fd(self) -> RawFd {
-                self.$field.into_raw_fd()
+        impl<T> From<$ty> for OwnedFd {
+            fn from(val: $ty) -> OwnedFd {
+                OwnedFd::from(val.$field)
             }
         }
 
@@ -82,6 +78,12 @@ macro_rules! fd_impl {
                     $field: value,
                     _marker: std::marker::PhantomData,
                 }
+            }
+        }
+
+        impl<T> AsFd for $ty {
+            fn as_fd(&self) -> BorrowedFd<'_> {
+                self.$field.as_fd()
             }
         }
 
@@ -135,7 +137,7 @@ impl<T: Serialize + DeserializeOwned> Receiver<T> {
     /// Receives a structured message from the socket.
     pub async fn recv(&self) -> io::Result<T> {
         let (buf, fds) = self.raw_receiver.recv().await?;
-        deserialize::<(T, bool)>(&buf, fds.as_deref().unwrap_or_default()).map(|x| x.0)
+        deserialize::<(T, bool)>(&buf, fds).map(|x| x.0)
     }
 }
 
@@ -148,13 +150,13 @@ impl<T: Serialize + DeserializeOwned> Sender<T> {
         self.raw_sender
     }
 
-    /// Receives a structured message from the socket.
+    /// Sends a structured message from the socket.
     pub async fn send(&self, s: T) -> io::Result<()> {
         // we always serialize a dummy bool at the end so that the message
         // will not be empty because of zero sized types.
-        let (payload, fds) = serialize((s, true))?;
-        self.raw_sender.send(&payload, &fds).await?;
-        Ok(())
+        let to_send = (s, true);
+        let (payload, fds) = serialize(&to_send)?;
+        self.raw_sender.send(&payload, &fds).await.map(|_| ())
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "tokio-unix-ipc"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "A minimal abstraction for IPC via unix sockets."
@@ -10,7 +10,7 @@ keywords = ["ipc", "unix-socket", "subprocess"]
 readme = "README.md"
 autoexamples = true
 autotests = true
-rust-version = "1.60"
+rust-version = "1.66"
 
 [package.metadata.docs.rs]
 all-features = true

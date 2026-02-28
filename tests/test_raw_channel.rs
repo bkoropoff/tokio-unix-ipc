@@ -12,7 +12,7 @@ async fn test_basic() {
 
     let (bytes, fds) = rx.recv().await.unwrap();
     assert_eq!(bytes, b"Hello World!");
-    assert_eq!(fds, None);
+    assert!(fds.is_empty());
 }
 
 #[tokio::test]
@@ -31,7 +31,7 @@ async fn test_creds() {
 
     let (bytes, fds, creds) = rx.recv_with_credentials().await.unwrap();
     assert_eq!(bytes, b"Hello World!");
-    assert_eq!(fds, None);
+    assert!(fds.is_empty());
     assert_eq!(creds.uid(), myuid);
     assert_eq!(creds.pid(), mypid);
 }
@@ -52,5 +52,5 @@ async fn test_large_buffer() {
 
     let (bytes, fds) = rx.recv().await.unwrap();
     assert_eq!(bytes, buf.as_bytes());
-    assert_eq!(fds, None);
+    assert!(fds.is_empty());
 }
