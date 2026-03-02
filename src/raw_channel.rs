@@ -186,6 +186,11 @@ fn recv_impl(
     let mut cmsgspace = vec![0u8; msgspace_size as usize];
 
     let msg = nix_eintr!(recvmsg::<()>(fd, &mut iov, Some(&mut cmsgspace), MSG_FLAGS))?;
+    if msg.flags.contains(MsgFlags::MSG_CTRUNC) {
+        return Err(io::Error::other(
+            "control message truncated",
+        ));
+    }
 
     let mut received_fds = false;
     for cmsg in msg.cmsgs() {
